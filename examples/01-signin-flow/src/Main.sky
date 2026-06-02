@@ -1,0 +1,274 @@
+module Main exposing (main)
+
+-- | sky-github example 01: sign-in flow.
+--
+-- A minimal Sky.Http.Server app demonstrating the full GitHub
+-- OAuth round-trip:
+--
+--   GET  /            — landing page with "Sign in with GitHub" link.
+--   GET  /signin      — redirects to GitHub's consent screen
+--                       (after dropping a one-shot CSRF cookie).
+--   GET  /auth/callback — handles GitHub's redirect; verifies the
+--                         state, exchanges the code for an access
+--                         token, fetches the user profile, drops
+--                         a session cookie, redirects to /profile.
+--   GET  /profile     — reads the session cookie and renders the
+--                       signed-in user's profile (or 401 if the
+--                       cookie is absent).
+--   GET  /logout      — clears the session cookie + redirects to /.
+--
+-- The session store is an in-memory `IORef`-equivalent on the
+-- runtime side (`Sky.Core.Db.connect "memory"` — see comment in
+-- `sessionStore` below).  Production apps point at the real Db.
+--
+-- Run this example:
+--
+--     export GITHUB_CLIENT_ID=Iv1.xxxxxxxxxxxxxxxx
+--     export GITHUB_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+--     export OAUTH_REDIRECT_URI=http://localhost:8001/auth/callback
+--     sky build src/Main.sky && ./sky-out/app
+--
+-- Without env vars, the app still boots — every route surfaces a
+-- "missing config" message so you can verify the integration
+-- shape without a real GitHub OAuth app.  The authorize URL is
+-- also printed to stdout at startup so you can copy-paste it.
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Crypto as Crypto
+import Sky.Core.Error as Error exposing (Error)
+import Sky.Core.String as String
+import Sky.Core.System as System
+import Sky.Core.Task as Task
+import Sky.Http.Server as Server
+import Sky.Http.Server exposing (Request, Response)
+import Std.Log exposing (println)
+import Github.Oauth as Oauth
+import Github.User as GhUser
+import Github.Types as Types
+
+
+-- ─── Config ─────────────────────────────────────────────────────
+
+
+-- | Read OAuth config from the environment.  Empty string when
+-- the env var isn't set; handlers branch on that to render a
+-- helpful "missing config" page instead of 500'ing.
+clientId : String
+clientId =
+    System.getenvOr "GITHUB_CLIENT_ID" ""
+
+
+clientSecret : String
+clientSecret =
+    System.getenvOr "GITHUB_CLIENT_SECRET" ""
+
+
+redirectUri : String
+redirectUri =
+    System.getenvOr "OAUTH_REDIRECT_URI" "http://localhost:8001/auth/callback"
+
+
+-- | Sky.Auth-style CSRF secret.  Not for signing user sessions —
+-- this is only the HMAC key used in the state cookie probe.
+csrfSecret : String
+csrfSecret =
+    System.getenvOr "OAUTH_STATE_SECRET" "demo-state-secret-replace-in-prod"
+
+
+-- ─── Entry ──────────────────────────────────────────────────────
+main : Task Error ()
+main =
+    let
+        -- Dummy session: just stash the user login in a cookie.  A
+        -- real app would sign it via Std.Auth.signTokenWithClaims
+        -- and store the access token server-side.
+        sample =
+            Oauth.authorizeUrl
+                { clientId = clientId
+                , redirectUri = redirectUri
+                , scopes = [ "read:user", "user:email" ]
+                , state = "DEMO-STATE-NOT-FOR-PROD"
+                }
+        _ = println ""
+        _ = println "sky-github example — signin-flow"
+        _ = println ("Authorize URL (with demo state): " ++ sample)
+        _ = println ""
+        _ = println "Routes:"
+        _ = println "  GET  /            — landing page"
+        _ = println "  GET  /signin      — start OAuth flow"
+        _ = println "  GET  /auth/callback — handle GitHub redirect"
+        _ = println "  GET  /profile     — signed-in user info"
+        _ = println "  GET  /logout      — clear session"
+        _ = println ""
+        _ = println "Listening on http://localhost:8001"
+    in
+        Server.listen
+            8001
+            [ Server.get "/" handleHome
+            , Server.get "/signin" handleSignin
+            , Server.get "/auth/callback" handleCallback
+            , Server.get "/profile" handleProfile
+            , Server.get "/logout" handleLogout
+            ]
+
+
+-- ─── Routes ─────────────────────────────────────────────────────
+handleHome : Request -> Task Error Response
+handleHome req =
+    Task.succeed
+        (Server.html
+            """<!DOCTYPE html>
+<html>
+    <head><title>sky-github example</title></head>
+    <body style="font-family: system-ui; max-width: 36rem; margin: 4rem auto;">
+        <h1>sky-github example — signin-flow</h1>
+        <p>This is a minimal Sky Lang app demonstrating the GitHub OAuth flow via the <code>sky-github</code> package.</p>
+        <p><a href="/signin">Sign in with GitHub</a></p>
+        <hr>
+        <p style="color:#888"><small>If you reach the consent screen but the callback fails with a missing-config message, set <code>GITHUB_CLIENT_ID</code> and <code>GITHUB_CLIENT_SECRET</code> in the environment.</small></p>
+    </body>
+</html>""")
+
+
+handleSignin : Request -> Task Error Response
+handleSignin req =
+    if String.isEmpty clientId then
+        Task.succeed (missingConfigResponse "GITHUB_CLIENT_ID")
+
+    else
+        -- Generate a fresh CSRF state token.  In production a
+        -- pure-server flow would derive this from a signed cookie
+        -- (Sso.newState pattern) so the verify step is HMAC-
+        -- backed rather than cookie-echo.  For the demo we use
+        -- Crypto.randomToken + a plain one-shot cookie.
+        Crypto.randomToken 16
+            |> Task.andThen
+                   (\state ->
+                       let
+        -- Clear the cookie by setting it to empty with Max-Age=0.
+                           url =
+                               Oauth.authorizeUrl
+                                   { clientId = clientId
+                                   , redirectUri = redirectUri
+                                   , scopes = [ "read:user", "user:email" ]
+                                   , state = state
+                                   }
+                           stateCookie = Server.cookie "oauth_state" state
+                       in
+                           Task.succeed
+                               (Server.redirect url
+                                   |> Server.withCookie stateCookie))
+
+
+handleCallback : Request -> Task Error Response
+handleCallback req =
+    let
+        code = Server.queryParam "code" req
+        returnedState = Server.queryParam "state" req
+        cookieState = Server.getCookie "oauth_state" req
+    in
+        if String.isEmpty clientId || String.isEmpty clientSecret then
+            Task.succeed
+                (missingConfigResponse "GITHUB_CLIENT_ID + GITHUB_CLIENT_SECRET")
+
+        else if returnedState /= cookieState then
+            -- State mismatch — possible CSRF, or the user clicked
+            -- the link in two tabs.  Refuse the exchange.
+            Task.succeed
+                (Server.text "Bad request: oauth state mismatch"
+                    |> Server.withStatus 400)
+
+        else
+            case code of
+
+                Nothing ->
+                    Task.succeed
+                        (Server.text "Bad request: missing oauth code"
+                            |> Server.withStatus 400)
+
+                Just c ->
+                    exchangeAndFetchProfile c
+
+
+exchangeAndFetchProfile : String -> Task Error Response
+exchangeAndFetchProfile code =
+    let
+        params =
+            { clientId = clientId
+            , clientSecret = clientSecret
+            , code = code
+            , redirectUri = redirectUri
+            }
+    in
+        Oauth.exchangeCode params
+            |> Task.andThen
+                   (\accessToken ->
+                       GhUser.current accessToken
+                           |> Task.andThen (renderSignedIn accessToken))
+            |> Task.onError reportCallbackError
+
+
+renderSignedIn : Types.AccessToken -> Types.User -> Task Error Response
+renderSignedIn accessToken user =
+    let
+        sessionCookie = Server.cookie "session_login" user.login
+    in
+        Task.succeed
+            (Server.redirect "/profile" |> Server.withCookie sessionCookie)
+
+
+reportCallbackError : Error -> Task Error Response
+reportCallbackError e =
+    Task.succeed
+        (Server.text ("OAuth callback failed: " ++ Error.toString e)
+            |> Server.withStatus 500)
+
+
+handleProfile : Request -> Task Error Response
+handleProfile req =
+    case Server.getCookie "session_login" req of
+
+        Nothing ->
+            Task.succeed
+                (Server.html
+                    """<!DOCTYPE html>
+<html><body style="font-family: system-ui; max-width: 36rem; margin: 4rem auto;">
+    <h1>Not signed in</h1>
+    <p><a href="/signin">Sign in with GitHub</a></p>
+</body></html>"""
+                    |> Server.withStatus 401)
+
+        Just login ->
+            Task.succeed
+                (Server.html
+                    ("""<!DOCTYPE html>
+<html><body style="font-family: system-ui; max-width: 36rem; margin: 4rem auto;">
+    <h1>Signed in</h1>
+    <p>Hello, <strong>"""
+                        ++ login
+                        ++ """</strong>!</p>
+    <p><a href="/logout">Sign out</a></p>
+</body></html>"""))
+
+
+handleLogout : Request -> Task Error Response
+handleLogout req =
+    let
+        cleared = Server.cookie "session_login" ""
+    in
+        Task.succeed (Server.redirect "/" |> Server.withCookie cleared)
+
+
+-- ─── Helpers ────────────────────────────────────────────────────
+missingConfigResponse : String -> Response
+missingConfigResponse vars =
+    Server.html
+        ("""<!DOCTYPE html>
+<html><body style="font-family: system-ui; max-width: 36rem; margin: 4rem auto;">
+    <h1>Missing config</h1>
+    <p>This demo needs the following env vars set:</p>
+    <pre>"""
+            ++ vars
+            ++ """</pre>
+    <p>Create a GitHub OAuth App at <a href="https://github.com/settings/developers">github.com/settings/developers</a>, then export the client id / secret and re-run.</p>
+</body></html>""")
+        |> Server.withStatus 503

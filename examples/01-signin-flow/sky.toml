@@ -1,0 +1,14 @@
+name = "signin-flow"
+version = "0.1.0"
+entry = "src/Main.sky"
+
+[source]
+root = "src"
+
+# Sky's dep resolver only speaks git URLs in `[dependencies]`
+# today.  Inside this monorepo we point at the sibling
+# `sky-github` package via a `src/Github` symlink (see
+# `src/Github`).  When this example is consumed standalone after
+# `sky add github.com/anzellai/sky-github` lands, the symlink
+# gets replaced with a `[dependencies]` entry and the import
+# lines below stay byte-identical.

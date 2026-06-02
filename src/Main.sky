@@ -1,0 +1,32 @@
+module Main exposing (main)
+
+-- | Stub entry point — sky-github is a library, not an app.
+--
+-- The Sky compiler's `sky build` requires `entry = …` in
+-- sky.toml; we point at this stub so the package is buildable
+-- in isolation for development + CI smoke-testing.  Consumers
+-- import `Github.Oauth` / `Github.User` / `Github.Types`
+-- directly; they never see Main.sky.
+--
+-- `main` references every public binding so dead-code
+-- elimination keeps them and `sky build` genuinely type-checks
+-- the whole package.  A bare `main = ()` lets DCE prune
+-- everything, leaving a hollow smoke test that wouldn't catch,
+-- e.g., an unresolved name in an un-called function.
+import Sky.Core.Prelude exposing (..)
+import Github.Oauth as Oauth
+import Github.User as User
+import Github.Types as Types
+
+
+main : ()
+main =
+    let
+        _ = Oauth.authorizeUrl
+        _ = Oauth.exchangeCode
+        _ = User.current
+        _ = User.orgMembership
+        _ = Types.emptyToken
+        _ = Types.emptyUser
+    in
+        ()

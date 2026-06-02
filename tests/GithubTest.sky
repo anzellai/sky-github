@@ -1,0 +1,294 @@
+module GithubTest exposing (tests)
+
+-- | Smoke tests for sky-github.
+--
+-- These tests don't touch the network — they exercise the pure
+-- pieces of the package: URL builders + JSON decoders + the
+-- empty-string-to-Nothing collapse used by the user decoder.  A
+-- live end-to-end test against GitHub belongs in
+-- `examples/01-signin-flow/` (which is run interactively against
+-- a real OAuth app).
+--
+-- Run with:
+--
+--     sky test tests/GithubTest.sky
+--
+-- A note on parser-friendly structure: the `case … of` shape
+-- inside a `(\_ -> let … in case … of …)` lambda confused Sky's
+-- top-level-declaration parser, so JSON-decode assertions are
+-- pulled out as top-level helpers returning `Test.TestResult`
+-- and the per-test thunk just calls the helper.
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.Json.Decode as JsonDec
+import Sky.Test as Test exposing (Test, TestResult)
+import Github.Oauth as Oauth
+import Github.Types as Types
+
+
+tests : List Test
+tests =
+    [ Test.suite
+          "Github.Oauth.authorizeUrl"
+          [ Test.test
+                "starts with the GitHub authorize endpoint"
+                (\_ ->
+                    Test.isTrue
+                        (String.startsWith
+                            "https://github.com/login/oauth/authorize?"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "contains the client_id"
+                (\_ ->
+                    Test.isTrue
+                        (String.contains
+                            "client_id=abc123"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "url-encodes the redirect_uri"
+                (\_ ->
+                    Test.isTrue
+                        (String.contains
+                            "redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "joins scopes with a single space"
+                (\_ ->
+                    Test.isTrue
+                        (String.contains
+                            "scope=read%3Auser+user%3Aemail"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "carries the CSRF state verbatim"
+                (\_ ->
+                    Test.isTrue
+                        (String.contains
+                            "state=xyz789"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "enables allow_signup"
+                (\_ ->
+                    Test.isTrue
+                        (String.contains
+                            "allow_signup=true"
+                            (Oauth.authorizeUrl sampleAuthorizeParams)))
+          , Test.test
+                "empty scopes list still produces a syntactically valid URL"
+                (\_ ->
+                    Test.isTrue
+                        (String.startsWith
+                            "https://github.com/login/oauth/authorize?"
+                            (Oauth.authorizeUrl emptyScopesParams)))
+          ]
+    , Test.suite
+          "Github.Types record defaults"
+          [ Test.test
+                "emptyToken.token is empty"
+                (\_ -> Test.equal "" (Types.emptyToken.token))
+          , Test.test
+                "emptyToken.scope is empty"
+                (\_ -> Test.equal "" (Types.emptyToken.scope))
+          , Test.test
+                "emptyUser.id is 0"
+                (\_ -> Test.equal 0 (Types.emptyUser.id))
+          , Test.test
+                "emptyUser.login is empty"
+                (\_ -> Test.equal "" (Types.emptyUser.login))
+          , Test.test
+                "emptyUser.name is Nothing"
+                (\_ -> Test.equal Nothing (Types.emptyUser.name))
+          , Test.test
+                "emptyUser.email is Nothing"
+                (\_ -> Test.equal Nothing (Types.emptyUser.email))
+          , Test.test
+                "record-update on emptyToken works"
+                (\_ -> Test.equal "gho_xxx" (updatedTokenStr ()))
+          ]
+    , Test.suite
+          "Json shape — OAuth token response"
+          [ Test.test
+                "access_token field decodes from success body"
+                (\_ -> assertAccessTokenDecodes ())
+          , Test.test
+                "error field decodes from GitHub's 200-with-error body"
+                (\_ -> assertErrorBodyDecodes ())
+          ]
+    , Test.suite
+          "Json shape — /user response decoders"
+          [ Test.test "user.id decodes as Int" (\_ -> assertUserIdDecodes ())
+          , Test.test
+                "user.login decodes as String"
+                (\_ -> assertUserLoginDecodes ())
+          , Test.test
+                "null name field is rejected by plain string decoder"
+                (\_ -> assertPlainStringRejectsNull ())
+          , Test.test
+                "null name field is accepted via oneOf-Maybe"
+                (\_ -> assertOneOfMaybeAcceptsNull ())
+          ]
+    , Test.suite
+          "Json shape — /user/memberships/orgs response"
+          [ Test.test
+                "active state field decodes"
+                (\_ ->
+                    assertMembershipState
+                        """{"state":"active","role":"member"}"""
+                        "active")
+          , Test.test
+                "pending state field decodes"
+                (\_ ->
+                    assertMembershipState
+                        """{"state":"pending","role":"member"}"""
+                        "pending")
+          ]
+    ]
+
+
+-- ─── Fixtures ──────────────────────────────────────────────────
+sampleAuthorizeParams : Oauth.AuthorizeParams
+sampleAuthorizeParams =
+    { clientId = "abc123"
+    , redirectUri = "https://app.example.com/cb"
+    , scopes = [ "read:user", "user:email" ]
+    , state = "xyz789"
+    }
+
+
+emptyScopesParams : Oauth.AuthorizeParams
+emptyScopesParams =
+    { clientId = "abc123"
+    , redirectUri = "https://app.example.com/cb"
+    , scopes = []
+    , state = "xyz789"
+    }
+
+
+-- ─── TestResult helpers (lifted from per-test thunks to keep
+-- the parser happy on case-of inside lambda-inside-list) ──────
+updatedTokenStr : () -> String
+updatedTokenStr _ =
+    let
+        base = Types.emptyToken
+        updated = { base | token = "gho_xxx" }
+    in
+        updated.token
+
+
+assertAccessTokenDecodes : () -> TestResult
+assertAccessTokenDecodes _ =
+    let
+        body =
+            """{"access_token":"gho_xxx","scope":"read:user user:email","token_type":"bearer"}"""
+        result =
+            JsonDec.decodeString
+                (JsonDec.field "access_token" JsonDec.string)
+                body
+    in
+        case result of
+
+            Ok tok ->
+                Test.equal "gho_xxx" tok
+
+            Err _ ->
+                Test.fail "access_token field missing"
+
+
+assertErrorBodyDecodes : () -> TestResult
+assertErrorBodyDecodes _ =
+    let
+        body =
+            """{"error":"bad_verification_code","error_description":"The code is incorrect."}"""
+        result =
+            JsonDec.decodeString (JsonDec.field "error" JsonDec.string) body
+    in
+        case result of
+
+            Ok e ->
+                Test.equal "bad_verification_code" e
+
+            Err _ ->
+                Test.fail "error field missing"
+
+
+assertUserIdDecodes : () -> TestResult
+assertUserIdDecodes _ =
+    let
+        body =
+            """{"id":42,"login":"octocat","name":"The Octocat","email":null,"avatar_url":"https://avatars.githubusercontent.com/u/42","html_url":"https://github.com/octocat"}"""
+        result = JsonDec.decodeString (JsonDec.field "id" JsonDec.int) body
+    in
+        case result of
+
+            Ok id_ ->
+                Test.equal 42 id_
+
+            Err _ ->
+                Test.fail "id field missing"
+
+
+assertUserLoginDecodes : () -> TestResult
+assertUserLoginDecodes _ =
+    let
+        body =
+            """{"id":42,"login":"octocat","name":null,"email":null,"avatar_url":"","html_url":""}"""
+        result =
+            JsonDec.decodeString (JsonDec.field "login" JsonDec.string) body
+    in
+        case result of
+
+            Ok l ->
+                Test.equal "octocat" l
+
+            Err _ ->
+                Test.fail "login field missing"
+
+
+assertPlainStringRejectsNull : () -> TestResult
+assertPlainStringRejectsNull _ =
+    let
+        body = """{"name":null}"""
+        result =
+            JsonDec.decodeString (JsonDec.field "name" JsonDec.string) body
+    in
+        case result of
+
+            Ok _ ->
+                Test.fail "plain string decoder should fail on null"
+
+            Err _ ->
+                Test.pass
+
+
+assertOneOfMaybeAcceptsNull : () -> TestResult
+assertOneOfMaybeAcceptsNull _ =
+    let
+        body = """{"name":null}"""
+        dec =
+            JsonDec.field
+                "name"
+                (JsonDec.oneOf
+                    [ JsonDec.map Just JsonDec.string, JsonDec.succeed Nothing ])
+        result = JsonDec.decodeString dec body
+    in
+        case result of
+
+            Ok m ->
+                Test.equal Nothing m
+
+            Err _ ->
+                Test.fail "oneOf-Maybe decoder should accept null"
+
+
+assertMembershipState : String -> String -> TestResult
+assertMembershipState body expected =
+    let
+        result =
+            JsonDec.decodeString (JsonDec.field "state" JsonDec.string) body
+    in
+        case result of
+
+            Ok s ->
+                Test.equal expected s
+
+            Err _ ->
+                Test.fail "state field missing"

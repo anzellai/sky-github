@@ -1,0 +1,83 @@
+module Github.Types exposing (AccessToken, User, emptyToken, emptyUser)
+
+-- | Github.Types — shared records for the OAuth + user-profile path.
+--
+-- All `Github.*` failures land as `Sky.Core.Error.Error` via
+-- `Error.unexpected` / `Error.network` / `Error.decode` — see
+-- `Github.Oauth` + `Github.User` for the call-site usage.  This
+-- module deliberately holds no Error subtype: piggy-backing on the
+-- stdlib's unified `Error` keeps integration shallow (no `Github.Error
+-- -> AppError` wrappers in consumer code).
+--
+-- Why standalone records (not anonymous types in each function sig):
+-- Sky doesn't yet allow anonymous records in function signatures
+-- (Limitation #1 was lifted but Sky's cross-module structural
+-- typing still benefits from named aliases for cache + LSP).  The
+-- `empty*` constructors are convenience scaffolding for tests + a
+-- discoverable starting point for callers building requests by
+-- hand.
+import Sky.Core.Prelude exposing (..)
+
+-- | An OAuth 2.0 access token issued by GitHub.
+--
+-- Returned by `Github.Oauth.exchangeCode` after the user-facing
+-- redirect dance completes.  Treat the `token` field as a secret:
+-- it's a bearer credential — anyone holding it can act as the user
+-- against the GitHub API for as long as it stays valid (GitHub
+-- tokens currently don't expire unless the user revokes the
+-- app, but assume they might in the future).
+--
+-- `scope` echoes what the user actually granted (may be narrower
+-- than what was requested if the user manually de-selected scopes
+-- on the consent screen).  `tokenType` is currently always
+-- `"bearer"` for GitHub OAuth — kept on the record so we can
+-- forward-port to providers that mix `mac` / `bearer` without
+-- breaking the API.
+type alias AccessToken =
+    { token : String
+    , scope : String
+    , tokenType : String
+    }
+
+-- | A GitHub user's public-ish profile.
+--
+-- `id` is the IdP-stable unique identifier — ALWAYS use this as
+-- the join key in your own user table, never `login` (a user can
+-- rename themselves and the login follows; `id` survives).
+--
+-- `name` / `email` are `Maybe String` because GitHub returns
+-- `null` for either field when the user has hidden it / never
+-- set it.  A bare empty string in the wire response is also
+-- mapped to `Nothing` so consumers don't have to repeat the
+-- "treat empty as missing" logic.
+--
+-- `avatarUrl` + `htmlUrl` are non-optional in practice (every
+-- user has both) so they stay bare `String`.
+type alias User =
+    { id : Int
+    , login : String
+    , name : Maybe String
+    , email : Maybe String
+    , avatarUrl : String
+    , htmlUrl : String
+    }
+
+
+-- | A zero-valued `AccessToken` — useful for tests and as a
+-- discoverable default the caller may then update via
+-- record-update syntax (`{ emptyToken | token = "..." }`).
+emptyToken : AccessToken
+emptyToken =
+    { token = "", scope = "", tokenType = "" }
+
+
+-- | A zero-valued `User` — same role as `emptyToken`.
+emptyUser : User
+emptyUser =
+    { id = 0
+    , login = ""
+    , name = Nothing
+    , email = Nothing
+    , avatarUrl = ""
+    , htmlUrl = ""
+    }

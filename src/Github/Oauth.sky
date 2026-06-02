@@ -1,0 +1,207 @@
+module Github.Oauth exposing (authorizeUrl, exchangeCode, AuthorizeParams, ExchangeParams)
+
+-- | Github.Oauth — the OAuth 2.0 sign-in flow for GitHub.
+--
+-- Two primitives:
+--   * `authorizeUrl` — build the URL to redirect the user to
+--     for the consent screen.
+--   * `exchangeCode` — swap the `code` the user comes back with
+--     for an `AccessToken`.
+--
+-- Both are deliberately minimal: the caller owns state (CSRF
+-- token), session cookies, the redirect-back routing, and token
+-- storage.  This package never touches a database and never
+-- mints a session; it just bridges the OAuth dance.
+--
+-- Security checklist a consumer MUST honour:
+--   * Generate a fresh random `state` per sign-in attempt (e.g.
+--     `Crypto.randomToken 16`).  Stash it in a one-shot
+--     `HttpOnly; Secure; SameSite=Lax` cookie before the
+--     redirect.  On callback, verify the returned `state`
+--     matches the cookie before calling `exchangeCode`.  Without
+--     this check, an attacker can trick a victim into signing in
+--     as the attacker's account ("login CSRF").
+--   * Treat the returned `AccessToken.token` as a secret — never
+--     log it, never leak it into a URL, store at-rest encrypted
+--     if the persistence layer isn't already secure.
+--   * Pin scopes to the minimum the app needs.  Identity-only
+--     sign-in wants `["read:user", "user:email"]`.
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Encoding as Encoding
+import Sky.Core.Error as Error exposing (Error)
+import Sky.Core.Http as Http
+import Sky.Core.Json.Decode as JsonDec
+import Sky.Core.Json.Decode.Pipeline as P
+import Sky.Core.List as List
+import Sky.Core.String as String
+import Sky.Core.Task as Task
+import Github.Types exposing (AccessToken)
+
+-- | Input to `authorizeUrl`.
+--
+-- `scopes` is a `List String` (each entry is one OAuth scope —
+-- `"read:user"`, `"user:email"`, etc).  They are joined with a
+-- single space, which is GitHub's canonical encoding for the
+-- `scope` parameter.  Empty list is permitted (GitHub uses its
+-- default scope) but discouraged — be explicit.
+--
+-- `state` is the caller-supplied CSRF token; the package does NOT
+-- generate or verify it (see the module doc above).
+type alias AuthorizeParams =
+    { clientId : String
+    , redirectUri : String
+    , scopes : List String
+    , state : String
+    }
+
+-- | Input to `exchangeCode`.
+--
+-- `code` is the authorization code GitHub appended as a query
+-- parameter on the callback URL.  `redirectUri` MUST match the
+-- one used in `authorizeUrl` (GitHub validates the pair).
+type alias ExchangeParams =
+    { clientId : String
+    , clientSecret : String
+    , code : String
+    , redirectUri : String
+    }
+
+
+-- | `authorizeUrl params` — the URL to redirect the user to so
+-- they can grant your app access.  302 the user here from your
+-- sign-in handler.
+--
+-- The URL is built from `https://github.com/login/oauth/authorize`
+-- with the standard OAuth 2.0 query parameters (`client_id`,
+-- `redirect_uri`, `scope`, `state`) plus GitHub's `allow_signup=true`
+-- (lets visitors create an account inline if they don't have one).
+authorizeUrl : AuthorizeParams -> String
+authorizeUrl params =
+    let
+        scopeStr = String.join " " params.scopes
+        pairs =
+            [ ( "client_id", params.clientId )
+            , ( "redirect_uri", params.redirectUri )
+            , ( "scope", scopeStr )
+            , ( "state", params.state )
+            , ( "allow_signup", "true" )
+            ]
+    in
+        "https://github.com/login/oauth/authorize?" ++ joinPairs pairs
+
+
+-- | `exchangeCode params` — swap the authorization code returned
+-- on the callback URL for an `AccessToken`.  Server-to-server
+-- POST to GitHub's token endpoint with the client secret in the
+-- body; the browser never sees it.
+--
+-- Returns `Task Error AccessToken`.  The error path covers
+-- network failure, an unexpected HTTP status from GitHub, and
+-- malformed / missing-fields JSON.  GitHub's own error responses
+-- (`error=bad_verification_code` etc) come back as `200 OK` with
+-- the error fields in the body — we detect those and surface a
+-- `Error.unexpected` carrying GitHub's `error_description`.
+exchangeCode : ExchangeParams -> Task Error AccessToken
+exchangeCode params =
+    let
+        body =
+            joinPairs
+                [ ( "client_id", params.clientId )
+                , ( "client_secret", params.clientSecret )
+                , ( "code", params.code )
+                , ( "redirect_uri", params.redirectUri )
+                ]
+        req =
+            Http.defaultRequest "https://github.com/login/oauth/access_token"
+                |> Http.withMethod "POST"
+                |> Http.withHeader
+                       "Content-Type"
+                       "application/x-www-form-urlencoded"
+                |> Http.withHeader "Accept" "application/json"
+                |> Http.withHeader "User-Agent" userAgent
+                |> Http.withBody body
+                |> Http.withTimeout 30000
+    in
+        Http.request req |> Task.andThen handleTokenResponse
+
+
+-- | The User-Agent every Github.* HTTP call sets.  GitHub
+-- rejects requests without a UA; this value is intentionally
+-- stable so it shows up in audit logs as identifiable.
+userAgent : String
+userAgent =
+    "sky-github/0.1"
+
+
+-- ─── Token-exchange response handling ──────────────────────────
+handleTokenResponse : Http.HttpResponse -> Task Error AccessToken
+handleTokenResponse resp =
+    if resp.status < 200 || resp.status >= 300 then
+        Task.fail
+            (Error.network
+                ("github: token endpoint returned HTTP "
+                    ++ String.fromInt resp.status))
+
+    else
+        case JsonDec.decodeString tokenErrorProbe resp.body of
+
+            Ok desc ->
+                -- GitHub returned 200 OK with an `error` field —
+                -- surface its `error_description` directly.
+                Task.fail (Error.unexpected ("github oauth: " ++ desc))
+
+            Err _ ->
+                -- No `error` field; decode the success shape.
+                case JsonDec.decodeString accessTokenDecoder resp.body of
+
+                    Ok token ->
+                        Task.succeed token
+
+                    Err e ->
+                        Task.fail
+                            (Error.decode
+                                ("github oauth: token response decode failed — "
+                                    ++ Error.toString e))
+
+
+-- | Probe decoder for the GitHub "OK-with-an-error-payload"
+-- shape.  Bodies that don't carry an `error` field fail this
+-- decoder cleanly, falling through to the success-shape decoder.
+tokenErrorProbe : JsonDec.Decoder String
+tokenErrorProbe =
+    JsonDec.field
+        "error"
+        (JsonDec.string
+            |> JsonDec.andThen
+                   (\err ->
+                       JsonDec.oneOf
+                           [ JsonDec.field "error_description" JsonDec.string
+                           , JsonDec.succeed err
+                           ]))
+
+
+-- | Decoder for the GitHub OAuth token response.  GitHub returns
+-- `access_token` (required), `scope` (granted scopes, possibly
+-- empty), and `token_type` (always `"bearer"` today).  We map
+-- straight to `AccessToken`; missing scope / token_type default
+-- to empty / "bearer" respectively.
+accessTokenDecoder : JsonDec.Decoder AccessToken
+accessTokenDecoder =
+    JsonDec.succeed (\tok sc tt -> { token = tok, scope = sc, tokenType = tt })
+        |> P.required "access_token" JsonDec.string
+        |> P.optional "scope" JsonDec.string ""
+        |> P.optional "token_type" JsonDec.string "bearer"
+
+
+-- ─── URL encoding helpers ──────────────────────────────────────
+
+
+-- | Join a list of `(key, value)` pairs into a URL-encoded query
+-- string body, using `Encoding.urlEncode` (backed by Go's
+-- `net/url.QueryEscape`).  Spaces encode as `+`, which both the
+-- authorize URL parser AND the token-exchange POST body parser
+-- on GitHub's side accept.
+joinPairs : List ( String, String ) -> String
+joinPairs pairs =
+    pairs |> List.map (\( k, v ) -> k ++ "=" ++ Encoding.urlEncode v)
+        |> String.join "&"

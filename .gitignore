@@ -1,0 +1,8 @@
+# Sky build artefacts
+sky-out/
+.skycache/
+.skydeps/
+
+# OS / editor cruft
+.DS_Store
+*.swp

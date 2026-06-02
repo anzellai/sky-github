@@ -1,0 +1,217 @@
+module Github.User exposing (current, orgMembership)
+
+-- | Github.User — fetch the authenticated user's profile + check
+-- org membership.
+--
+-- These are the two reads almost every "sign in with GitHub"
+-- consumer needs after `Github.Oauth.exchangeCode` returns:
+--
+--   * `current` — who is signed in.  Returns the full `User`
+--     record (id, login, name, email, avatar, profile URL).
+--     Backed by `GET /user`.  The `read:user` scope is enough
+--     to populate everything except the user's email when the
+--     user has marked it private; for verified-primary-email
+--     coverage, also grant `user:email`.
+--
+--   * `orgMembership` — is the user a member of a given GitHub
+--     org?  Backed by `GET /user/memberships/orgs/:org`.  Used
+--     for "admins-only" / "team-only" allowlists where the
+--     truth lives in GitHub teams rather than an app-internal
+--     table.  Requires the `read:org` scope; if the scope is
+--     missing the call returns `False` rather than an error
+--     (treat absence of evidence as not-a-member).
+--
+-- Every call sets `User-Agent: sky-github/0.1` (GitHub rejects
+-- requests without one) plus `Accept: application/vnd.github+json`
+-- (the v3 API media type) plus the standard
+-- `X-GitHub-Api-Version: 2022-11-28` header.
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Error as Error exposing (Error)
+import Sky.Core.Http as Http
+import Sky.Core.Json.Decode as JsonDec
+import Sky.Core.Json.Decode.Pipeline as P
+import Sky.Core.String as String
+import Sky.Core.Task as Task
+import Github.Types exposing (AccessToken, User)
+
+
+-- | `current accessToken` — fetch the authenticated user's
+-- profile.  Returns `Task Error User`.
+--
+-- Error path covers:
+--   * Network failure / timeout — `Error.network`.
+--   * Non-2xx from GitHub (401 token revoked, 403 rate limit,
+--     5xx upstream blip) — `Error.unexpected` with a status
+--     line; no raw GitHub error body is leaked.
+--   * JSON shape we don't recognise — `Error.decode`.
+current : AccessToken -> Task Error User
+current accessToken =
+    let
+        req =
+            Http.defaultRequest "https://api.github.com/user"
+                |> Http.withMethod "GET"
+                |> Http.withHeader
+                       "Authorization"
+                       ("Bearer " ++ accessToken.token)
+                |> Http.withHeader "Accept" "application/vnd.github+json"
+                |> Http.withHeader "X-GitHub-Api-Version" "2022-11-28"
+                |> Http.withHeader "User-Agent" userAgent
+                |> Http.withTimeout 30000
+    in
+        Http.request req |> Task.andThen handleUserResponse
+
+
+handleUserResponse : Http.HttpResponse -> Task Error User
+handleUserResponse resp =
+    if resp.status == 401 then
+        Task.fail
+            (Error.unexpected
+                "github: 401 unauthorized — token invalid or insufficient scope")
+
+    else if resp.status == 403 then
+        Task.fail
+            (Error.unexpected
+                "github: 403 forbidden — likely rate-limited or insufficient scope")
+
+    else if resp.status < 200 || resp.status >= 300 then
+        Task.fail
+            (Error.unexpected
+                ("github: /user returned HTTP " ++ String.fromInt resp.status))
+
+    else
+        case JsonDec.decodeString userDecoder resp.body of
+
+            Ok user ->
+                Task.succeed user
+
+            Err e ->
+                Task.fail
+                    (Error.decode
+                        ("github: /user response decode failed — "
+                            ++ Error.toString e))
+
+
+-- | `orgMembership accessToken org` — does the user belong to
+-- `org` (e.g. `"sky-lang"`)?
+--
+-- GitHub's `/user/memberships/orgs/:org` endpoint returns:
+--   * `200 OK` with `state` ∈ {`active`, `pending`} when the
+--     user is a member (we treat `active` as `True`, `pending`
+--     as `False` — pending invites haven't been accepted yet).
+--   * `404 Not Found` when the user is NOT a member, OR when
+--     the token doesn't carry `read:org` scope.  Both cases
+--     return `Task.succeed False` — the caller doesn't need to
+--     distinguish them to make an allow / deny decision.
+--   * Other statuses — surfaced as `Error.unexpected`.
+orgMembership : AccessToken -> String -> Task Error Bool
+orgMembership accessToken org =
+    let
+        req =
+            Http.defaultRequest
+                ("https://api.github.com/user/memberships/orgs/" ++ org)
+                |> Http.withMethod "GET"
+                |> Http.withHeader
+                       "Authorization"
+                       ("Bearer " ++ accessToken.token)
+                |> Http.withHeader "Accept" "application/vnd.github+json"
+                |> Http.withHeader "X-GitHub-Api-Version" "2022-11-28"
+                |> Http.withHeader "User-Agent" userAgent
+                |> Http.withTimeout 30000
+    in
+        Http.request req |> Task.andThen handleMembershipResponse
+
+
+handleMembershipResponse : Http.HttpResponse -> Task Error Bool
+handleMembershipResponse resp =
+    if resp.status == 200 then
+        case JsonDec.decodeString membershipStateDecoder resp.body of
+
+            Ok state ->
+                Task.succeed (state == "active")
+
+            Err _ ->
+                -- Unknown response shape — treat as not-a-member.
+                Task.succeed False
+
+    else if resp.status == 404 then
+        Task.succeed False
+
+    else if resp.status == 401 then
+        Task.fail
+            (Error.unexpected
+                "github: 401 unauthorized — token invalid or insufficient scope")
+
+    else
+        Task.fail
+            (Error.unexpected
+                ("github: /user/memberships returned HTTP "
+                    ++ String.fromInt resp.status))
+
+
+-- ─── Decoders ──────────────────────────────────────────────────
+
+
+-- | The /user JSON shape.  GitHub uses snake_case; we map to
+-- camelCase Sky fields at decode time.  `name` and `email` are
+-- nullable in the wire response: GitHub serialises them as JSON
+-- `null` when the user has no display name / has marked their
+-- email private.  We map both `null` AND empty strings to
+-- `Nothing` so callers can rely on `Just x` meaning "user has
+-- a usable value here".
+userDecoder : JsonDec.Decoder User
+userDecoder =
+    JsonDec.succeed
+        (\id_ login name email avatar html ->
+            { id = id_
+            , login = login
+            , name = nonEmpty name
+            , email = nonEmpty email
+            , avatarUrl = avatar
+            , htmlUrl = html
+            })
+        |> P.required "id" JsonDec.int
+        |> P.required "login" JsonDec.string
+        |> P.optional "name" nullableString Nothing
+        |> P.optional "email" nullableString Nothing
+        |> P.optional "avatar_url" JsonDec.string ""
+        |> P.optional "html_url" JsonDec.string ""
+
+
+-- | A decoder for a string-OR-null JSON field.  GitHub's `name`
+-- + `email` come back as either `"some string"` or literal
+-- `null`; the standard `JsonDec.string` decoder fails on `null`,
+-- so we wrap it with `oneOf` and fall through to `Nothing`.
+nullableString : JsonDec.Decoder (Maybe String)
+nullableString =
+    JsonDec.oneOf [ JsonDec.map Just JsonDec.string, JsonDec.succeed Nothing ]
+
+
+-- | Collapse an empty `Just ""` to `Nothing`.  Apps shouldn't
+-- have to distinguish "user explicitly set name to empty string"
+-- (GitHub rejects this anyway) from "user has no name".
+nonEmpty : Maybe String -> Maybe String
+nonEmpty m =
+    case m of
+
+        Just s ->
+            if String.isEmpty s then
+                Nothing
+
+            else
+                Just s
+
+        Nothing ->
+            Nothing
+
+
+-- | Decoder for `/user/memberships/orgs/:org` — pulls out the
+-- `state` field ("active" / "pending").
+membershipStateDecoder : JsonDec.Decoder String
+membershipStateDecoder =
+    JsonDec.field "state" JsonDec.string
+
+
+-- ─── Internal constants ────────────────────────────────────────
+userAgent : String
+userAgent =
+    "sky-github/0.1"

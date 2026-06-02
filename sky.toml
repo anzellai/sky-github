@@ -1,0 +1,24 @@
+name = "sky-github"
+version = "0.1.0"
+
+# A standalone Sky Lang package for GitHub OAuth (sign-in) plus the
+# user-profile fetch that completes a sign-in flow.  No GitHub App
+# math, no Git Data API — that surface lives elsewhere when extracted.
+#
+# This package is a library — `sky build` needs an entry, so we point
+# at a stub `Main.sky` that references every public binding so dead-
+# code elimination keeps them and the package genuinely type-checks
+# in isolation.  Consumers `import Github.Oauth` / `Github.User` /
+# `Github.Types` directly; they never see Main.sky.
+entry = "src/Main.sky"
+
+[source]
+root = "src"
+
+# Modules a consumer can `import` after `sky add github.com/anzellai/sky-github`.
+[lib]
+exposing = [
+  "Github.Oauth",
+  "Github.User",
+  "Github.Types",
+]
