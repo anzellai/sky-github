@@ -110,7 +110,7 @@ handleSignin req =
                    in
                        Task.succeed
                            (Server.redirect url
-                               |> Server.withCookie (Server.cookie "oauth_state" state)))
+                               |> Server.addCookie (Server.cookie "oauth_state" state)))
 
 
 -- Step 2: callback handler — verify state, exchange code, fetch user.

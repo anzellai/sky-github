@@ -156,7 +156,7 @@ handleSignin req =
                        in
                            Task.succeed
                                (Server.redirect url
-                                   |> Server.withCookie stateCookie))
+                                   |> Server.addCookie stateCookie))
 
 
 handleCallback : Request -> Task Error Response
@@ -213,7 +213,7 @@ renderSignedIn accessToken user =
         sessionCookie = Server.cookie "session_login" user.login
     in
         Task.succeed
-            (Server.redirect "/profile" |> Server.withCookie sessionCookie)
+            (Server.redirect "/profile" |> Server.addCookie sessionCookie)
 
 
 reportCallbackError : Error -> Task Error Response
@@ -255,7 +255,7 @@ handleLogout req =
     let
         cleared = Server.cookie "session_login" ""
     in
-        Task.succeed (Server.redirect "/" |> Server.withCookie cleared)
+        Task.succeed (Server.redirect "/" |> Server.addCookie cleared)
 
 
 -- ─── Helpers ────────────────────────────────────────────────────
